@@ -1,0 +1,19 @@
+====================================
+  REINICIAR SERVIDOR - INSTRUCCIONES
+====================================
+
+✅ Las tablas de turnos ya están instaladas en la base de datos.
+
+Ahora DEBES reiniciar el servidor:
+
+1. Ve a la terminal donde está corriendo el servidor
+2. Presiona: Ctrl + C
+3. Ejecuta: npm run dev
+4. Espera a que diga: "Servidor corriendo en http://localhost:3000"
+5. Ve a tu navegador y presiona F5 o Cmd+R
+6. Accede al panel de administración
+7. Ve a la pestaña "Turnos"
+8. Ya debería funcionar ✅
+
+IMPORTANTE: Si no reinicias el servidor, seguirá sin cargar los turnos.
+
