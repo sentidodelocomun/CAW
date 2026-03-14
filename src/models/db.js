@@ -1,15 +1,19 @@
-const mysql = require('mysql2');
+const { Pool } = require('pg');
 require('dotenv').config();
 
-const pool = mysql.createPool({
-  host: process.env.DB_HOST || 'localhost',
-  user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME || 'control_acceso',
-  port: process.env.DB_PORT || 3306,
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0
+const pool = new Pool({
+  connectionString: process.env.SUPABASE_DB_URL,
+  ssl: { rejectUnauthorized: false } // necesario en Supabase
 });
 
-module.exports = pool.promise();
+// Imitamos un poco la interfaz de mysql2: db.query(...) devuelve [rows]
+// y añadimos getClient() para manejar transacciones manuales
+module.exports = {
+  query: async (text, params) => {
+    const res = await pool.query(text, params);
+    return [res.rows, res];
+  },
+  getClient: async () => {
+    return pool.connect();
+  }
+};

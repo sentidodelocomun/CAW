@@ -29,7 +29,6 @@ router.post('/register', async (req, res) => {
   
   const { nombre, apellidos, email, identificacion, departamento, cargo, descriptor, image } = req.body;
   
-  // Validación de campos obligatorios
   if (!nombre || !apellidos || !email || !identificacion || !descriptor || !image) {
     console.error('❌ Faltan campos obligatorios');
     return res.status(400).json({ 
@@ -38,7 +37,6 @@ router.post('/register', async (req, res) => {
     });
   }
   
-  // Validar descriptor (debe ser array de 128 elementos)
   if (!Array.isArray(descriptor) || descriptor.length !== 128) {
     console.error('❌ Descriptor facial inválido');
     return res.status(400).json({ 
@@ -47,10 +45,10 @@ router.post('/register', async (req, res) => {
     });
   }
   
+  let client;
   try {
-    // Verificar si el email o identificación ya existen
     const [existingUsers] = await db.query(
-      'SELECT id, email, identificacion FROM usuarios WHERE email = ? OR identificacion = ?',
+      'SELECT id, email, identificacion FROM usuarios WHERE email = $1 OR identificacion = $2',
       [email, identificacion]
     );
     
@@ -72,40 +70,36 @@ router.post('/register', async (req, res) => {
       }
     }
     
-    // Iniciar transacción
-    await db.query('START TRANSACTION');
+    client = await db.getClient();
+    await client.query('BEGIN');
     
     try {
-      // Insertar usuario
-      const [userResult] = await db.query(
+      const userResult = await client.query(
         `INSERT INTO usuarios (nombre, apellidos, email, identificacion, departamento, cargo) 
-         VALUES (?, ?, ?, ?, ?, ?)`,
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id`,
         [nombre, apellidos, email, identificacion, departamento, cargo]
       );
       
-      const userId = userResult.insertId;
+      const userId = userResult.rows[0].id;
       console.log('✅ Usuario creado con ID:', userId);
       
-      // Insertar descriptor facial
-      // MySQL con tipo JSON hace la conversión automáticamente
-      await db.query(
-        'INSERT INTO descriptores_faciales (usuario_id, descriptor) VALUES (?, ?)',
+      await client.query(
+        'INSERT INTO descriptores_faciales (usuario_id, descriptor) VALUES ($1, $2)',
         [userId, JSON.stringify(descriptor)]
       );
       
       console.log('✅ Descriptor facial guardado');
       
-      // Guardar foto de registro
       const imageBuffer = processBase64Image(image);
-      await db.query(
-        'INSERT INTO fotos (usuario_id, imagen, tipo_captura) VALUES (?, ?, ?)',
+      await client.query(
+        'INSERT INTO fotos (usuario_id, imagen, tipo_captura) VALUES ($1, $2, $3)',
         [userId, imageBuffer, 'registro']
       );
       
       console.log('✅ Foto de registro guardada');
       
-      // Confirmar transacción
-      await db.query('COMMIT');
+      await client.query('COMMIT');
       
       console.log('✅ Registro completado exitosamente para:', nombre, apellidos);
       
@@ -124,12 +118,16 @@ router.post('/register', async (req, res) => {
       });
       
     } catch (error) {
-      // Revertir transacción en caso de error
-      await db.query('ROLLBACK');
+      await client.query('ROLLBACK');
       throw error;
+    } finally {
+      client.release();
     }
     
   } catch (error) {
+    if (client) {
+      try { client.release(); } catch (_) {}
+    }
     console.error('❌ Error en registro:', error);
     res.status(500).json({ 
       success: false,
@@ -146,10 +144,8 @@ router.post('/verify', async (req, res) => {
   
   const { descriptor, image, tipo_acceso = 'entrada' } = req.body;
   
-  // Log para debug
   console.log('📋 Tipo de acceso recibido:', tipo_acceso);
   
-  // Validación
   if (!descriptor || !image) {
     console.error('❌ Faltan campos obligatorios');
     return res.status(400).json({ 
@@ -175,7 +171,6 @@ router.post('/verify', async (req, res) => {
   }
   
   try {
-    // Obtener umbral de similitud de la configuración
     const [configResult] = await db.query(
       "SELECT valor FROM configuracion WHERE clave = 'umbral_similitud'"
     );
@@ -186,7 +181,6 @@ router.post('/verify', async (req, res) => {
     
     console.log('🎯 Umbral de similitud:', umbral);
     
-    // Obtener todos los usuarios activos con sus descriptores
     const [usuarios] = await db.query(`
       SELECT 
         u.id, u.nombre, u.apellidos, u.email, u.identificacion, 
@@ -207,12 +201,10 @@ router.post('/verify', async (req, res) => {
     
     console.log(`🔍 Comparando contra ${usuarios.length} descriptor(es) facial(es)...`);
     
-    // Buscar el mejor match
     let bestMatch = null;
     let minDistance = Infinity;
     
     for (const usuario of usuarios) {
-      // MySQL devuelve el JSON ya parseado como objeto/array
       const storedDescriptor = typeof usuario.descriptor === 'string' 
         ? JSON.parse(usuario.descriptor) 
         : usuario.descriptor;
@@ -226,29 +218,21 @@ router.post('/verify', async (req, res) => {
       }
     }
     
-    // Convertir distancia a similitud (0-1, donde 1 es idéntico)
-    // Distancia típica entre caras diferentes: ~0.6-1.0
-    // Distancia típica entre la misma cara: ~0.0-0.4
     const similitud = Math.max(0, 1 - minDistance);
     
     console.log(`🎯 Mejor coincidencia: ${bestMatch.nombre} ${bestMatch.apellidos}`);
     console.log(`📊 Similitud: ${(similitud * 100).toFixed(2)}% (distancia: ${minDistance.toFixed(4)})`);
     
-    // Guardar foto del intento
     const imageBuffer = processBase64Image(image);
-    const [fotoResult] = await db.query(
-      'INSERT INTO fotos (usuario_id, imagen, tipo_captura) VALUES (?, ?, ?)',
+    const [fotoRows] = await db.query(
+      'INSERT INTO fotos (usuario_id, imagen, tipo_captura) VALUES ($1, $2, $3) RETURNING id',
       [similitud >= umbral ? bestMatch.id : null, imageBuffer, 'verificacion']
     );
+    const fotoId = fotoRows[0].id;
     
-    const fotoId = fotoResult.insertId;
-    
-    // Verificar si supera el umbral
     if (similitud >= umbral) {
-      // ✅ RECONOCIMIENTO FACIAL EXITOSO
       console.log('✅ Rostro reconocido');
       
-      // Verificar configuración de turnos
       const [configTurnos] = await db.query(
         "SELECT valor FROM configuracion WHERE clave = 'validar_turnos'"
       );
@@ -259,35 +243,30 @@ router.post('/verify', async (req, res) => {
       let mensajeTurno = '';
       
       if (validarTurnos) {
-        // Verificar turno del usuario
         const [turnoActual] = await db.query(
-          'CALL obtener_turno_actual(?, NOW())',
+          'SELECT * FROM obtener_turno_actual($1, NOW())',
           [bestMatch.id]
         );
         
-        if (turnoActual && turnoActual[0] && turnoActual[0].length > 0) {
-          // Usuario tiene turno activo ahora
+        if (turnoActual && turnoActual.length > 0) {
           turnoValido = true;
-          turnoId = turnoActual[0][0].id;
-          mensajeTurno = ` - Turno: ${turnoActual[0][0].nombre}`;
-          console.log(`✅ Usuario en turno correcto: ${turnoActual[0][0].nombre}`);
+          turnoId = turnoActual[0].id;
+          mensajeTurno = ` - Turno: ${turnoActual[0].nombre}`;
+          console.log(`✅ Usuario en turno correcto: ${turnoActual[0].nombre}`);
         } else {
-          // Usuario NO tiene turno activo ahora
           turnoValido = false;
           
-          // Verificar si se permite acceso fuera de turno
           const [configPermitir] = await db.query(
             "SELECT valor FROM configuracion WHERE clave = 'permitir_acceso_fuera_turno'"
           );
           const permitirFueraTurno = configPermitir.length > 0 && configPermitir[0].valor === 'true';
           
           if (!permitirFueraTurno) {
-            // ❌ ACCESO DENEGADO POR TURNO
             console.log('❌ ACCESO DENEGADO - Fuera de turno');
             
             await db.query(
               `INSERT INTO accesos (usuario_id, tipo_acceso, estado, similitud_facial, motivo_denegacion, foto_id, turno_valido, ubicacion)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
               [bestMatch.id, tipo_acceso, 'denegado', similitud, 'Fuera de horario de turno', fotoId, false, 'Sistema Web']
             );
             
@@ -308,14 +287,12 @@ router.post('/verify', async (req, res) => {
         }
       }
       
-      // ✅ ACCESO AUTORIZADO
       console.log('✅ ACCESO AUTORIZADO' + mensajeTurno);
       console.log('📝 Registrando tipo de acceso:', tipo_acceso);
       
-      // Registrar acceso autorizado
       await db.query(
         `INSERT INTO accesos (usuario_id, tipo_acceso, estado, similitud_facial, foto_id, turno_valido, turno_id, ubicacion)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
         [bestMatch.id, tipo_acceso, 'autorizado', similitud, fotoId, turnoValido, turnoId, 'Sistema Web']
       );
       
@@ -337,13 +314,11 @@ router.post('/verify', async (req, res) => {
       });
       
     } else {
-      // ❌ ACCESO DENEGADO
       console.log('❌ ACCESO DENEGADO - Similitud insuficiente');
       
-      // Registrar acceso denegado
       await db.query(
         `INSERT INTO accesos (usuario_id, tipo_acceso, estado, similitud_facial, motivo_denegacion, foto_id, ubicacion)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
         [null, tipo_acceso, 'denegado', similitud, 'Similitud facial insuficiente', fotoId, 'Sistema Web']
       );
       
@@ -363,18 +338,17 @@ router.post('/verify', async (req, res) => {
   } catch (error) {
     console.error('❌ Error en verificación:', error);
     
-    // Registrar error
     try {
       const imageBuffer = processBase64Image(image);
-      const [fotoResult] = await db.query(
-        'INSERT INTO fotos (imagen, tipo_captura) VALUES (?, ?)',
+      const [fotoRows] = await db.query(
+        'INSERT INTO fotos (imagen, tipo_captura) VALUES ($1, $2) RETURNING id',
         [imageBuffer, 'desconocido']
       );
       
       await db.query(
         `INSERT INTO accesos (tipo_acceso, estado, motivo_denegacion, foto_id, ubicacion)
-         VALUES (?, ?, ?, ?, ?)`,
-        ['entrada', 'error', 'Error del sistema: ' + error.message, fotoResult.insertId, 'Sistema Web']
+         VALUES ($1, $2, $3, $4, $5)`,
+        ['entrada', 'error', 'Error del sistema: ' + error.message, fotoRows[0].id, 'Sistema Web']
       );
     } catch (logError) {
       console.error('Error al registrar el error:', logError);
@@ -388,7 +362,7 @@ router.post('/verify', async (req, res) => {
 });
 
 // ============================================
-// GET /api/usuarios - Listar usuarios (opcional)
+// GET /api/usuarios - Listar usuarios
 // ============================================
 router.get('/usuarios', async (req, res) => {
   try {
@@ -420,7 +394,7 @@ router.get('/usuarios', async (req, res) => {
 });
 
 // ============================================
-// GET /api/accesos - Listar últimos accesos (opcional)
+// GET /api/accesos - Listar últimos accesos
 // ============================================
 router.get('/accesos', async (req, res) => {
   try {
@@ -436,7 +410,7 @@ router.get('/accesos', async (req, res) => {
       FROM accesos a
       LEFT JOIN usuarios u ON a.usuario_id = u.id
       ORDER BY a.fecha_acceso DESC
-      LIMIT ?
+      LIMIT $1
     `, [limit]);
     
     res.status(200).json({
@@ -453,7 +427,7 @@ router.get('/accesos', async (req, res) => {
 });
 
 // ============================================
-// GET /api/configuracion - Obtener configuración del sistema
+// GET /api/configuracion
 // ============================================
 router.get('/configuracion', async (req, res) => {
   try {
@@ -484,45 +458,44 @@ router.post('/configuracion', async (req, res) => {
       max_descriptores_por_usuario 
     } = req.body;
     
-    // Actualizar cada configuración
     if (umbral_similitud !== undefined) {
       await db.query(
-        "UPDATE configuracion SET valor = ? WHERE clave = 'umbral_similitud'",
+        "UPDATE configuracion SET valor = $1 WHERE clave = 'umbral_similitud'",
         [umbral_similitud.toString()]
       );
     }
     
     if (dias_retencion_fotos !== undefined) {
       await db.query(
-        "UPDATE configuracion SET valor = ? WHERE clave = 'dias_retencion_fotos'",
+        "UPDATE configuracion SET valor = $1 WHERE clave = 'dias_retencion_fotos'",
         [dias_retencion_fotos.toString()]
       );
     }
     
     if (dias_retencion_logs !== undefined) {
       await db.query(
-        "UPDATE configuracion SET valor = ? WHERE clave = 'dias_retencion_logs'",
+        "UPDATE configuracion SET valor = $1 WHERE clave = 'dias_retencion_logs'",
         [dias_retencion_logs.toString()]
       );
     }
     
     if (max_descriptores_por_usuario !== undefined) {
       await db.query(
-        "UPDATE configuracion SET valor = ? WHERE clave = 'max_descriptores_por_usuario'",
+        "UPDATE configuracion SET valor = $1 WHERE clave = 'max_descriptores_por_usuario'",
         [max_descriptores_por_usuario.toString()]
       );
     }
     
     if (req.body.validar_turnos !== undefined) {
       await db.query(
-        "UPDATE configuracion SET valor = ? WHERE clave = 'validar_turnos'",
+        "UPDATE configuracion SET valor = $1 WHERE clave = 'validar_turnos'",
         [req.body.validar_turnos]
       );
     }
     
     if (req.body.permitir_acceso_fuera_turno !== undefined) {
       await db.query(
-        "UPDATE configuracion SET valor = ? WHERE clave = 'permitir_acceso_fuera_turno'",
+        "UPDATE configuracion SET valor = $1 WHERE clave = 'permitir_acceso_fuera_turno'",
         [req.body.permitir_acceso_fuera_turno]
       );
     }
@@ -543,14 +516,14 @@ router.post('/configuracion', async (req, res) => {
 });
 
 // ============================================
-// POST /api/usuarios/:id/desactivar - Desactivar usuario
+// POST /api/usuarios/:id/desactivar
 // ============================================
 router.post('/usuarios/:id/desactivar', async (req, res) => {
   try {
     const userId = req.params.id;
     
-    await db.query('UPDATE usuarios SET activo = FALSE WHERE id = ?', [userId]);
-    await db.query('UPDATE descriptores_faciales SET activo = FALSE WHERE usuario_id = ?', [userId]);
+    await db.query('UPDATE usuarios SET activo = FALSE WHERE id = $1', [userId]);
+    await db.query('UPDATE descriptores_faciales SET activo = FALSE WHERE usuario_id = $1', [userId]);
     
     console.log(`✅ Usuario ${userId} desactivado`);
     
@@ -568,14 +541,14 @@ router.post('/usuarios/:id/desactivar', async (req, res) => {
 });
 
 // ============================================
-// POST /api/usuarios/:id/activar - Activar usuario
+// POST /api/usuarios/:id/activar
 // ============================================
 router.post('/usuarios/:id/activar', async (req, res) => {
   try {
     const userId = req.params.id;
     
-    await db.query('UPDATE usuarios SET activo = TRUE WHERE id = ?', [userId]);
-    await db.query('UPDATE descriptores_faciales SET activo = TRUE WHERE usuario_id = ?', [userId]);
+    await db.query('UPDATE usuarios SET activo = TRUE WHERE id = $1', [userId]);
+    await db.query('UPDATE descriptores_faciales SET activo = TRUE WHERE usuario_id = $1', [userId]);
     
     console.log(`✅ Usuario ${userId} activado`);
     
@@ -599,12 +572,7 @@ router.post('/limpiar-bd', async (req, res) => {
   try {
     console.log('⚠️ Limpiando base de datos...');
     
-    await db.query('SET FOREIGN_KEY_CHECKS = 0');
-    await db.query('TRUNCATE TABLE accesos');
-    await db.query('TRUNCATE TABLE fotos');
-    await db.query('TRUNCATE TABLE descriptores_faciales');
-    await db.query('TRUNCATE TABLE usuarios');
-    await db.query('SET FOREIGN_KEY_CHECKS = 1');
+    await db.query('TRUNCATE TABLE accesos, fotos, descriptores_faciales, usuarios RESTART IDENTITY CASCADE');
     
     console.log('✅ Base de datos limpiada');
     
@@ -663,9 +631,10 @@ router.post('/turnos', async (req, res) => {
       });
     }
     
-    const [result] = await db.query(
+    const [resultRows] = await db.query(
       `INSERT INTO turnos (nombre, descripcion, hora_inicio, hora_fin, dias_semana, color)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id`,
       [nombre, descripcion, hora_inicio, hora_fin, JSON.stringify(dias_semana), color || '#667eea']
     );
     
@@ -674,7 +643,7 @@ router.post('/turnos', async (req, res) => {
     res.status(201).json({
       success: true,
       message: 'Turno creado correctamente',
-      turno_id: result.insertId
+      turno_id: resultRows[0].id
     });
   } catch (error) {
     console.error('Error al crear turno:', error);
@@ -693,9 +662,9 @@ router.put('/turnos/:id', async (req, res) => {
     
     await db.query(
       `UPDATE turnos 
-       SET nombre = ?, descripcion = ?, hora_inicio = ?, hora_fin = ?, 
-           dias_semana = ?, color = ?, activo = ?
-       WHERE id = ?`,
+       SET nombre = $1, descripcion = $2, hora_inicio = $3, hora_fin = $4, 
+           dias_semana = $5, color = $6, activo = $7
+       WHERE id = $8`,
       [nombre, descripcion, hora_inicio, hora_fin, JSON.stringify(dias_semana), color, activo, id]
     );
     
@@ -719,7 +688,7 @@ router.delete('/turnos/:id', async (req, res) => {
   try {
     const { id } = req.params;
     
-    await db.query('DELETE FROM turnos WHERE id = ?', [id]);
+    await db.query('DELETE FROM turnos WHERE id = $1', [id]);
     
     console.log('✅ Turno eliminado:', id);
     
@@ -751,7 +720,7 @@ router.get('/usuarios/:id/turnos', async (req, res) => {
         ut.activo as asignacion_activa
       FROM usuario_turnos ut
       INNER JOIN turnos t ON ut.turno_id = t.id
-      WHERE ut.usuario_id = ?
+      WHERE ut.usuario_id = $1
       ORDER BY ut.fecha_inicio DESC
     `, [id]);
     
@@ -783,7 +752,7 @@ router.post('/usuarios/:id/turnos', async (req, res) => {
     
     await db.query(
       `INSERT INTO usuario_turnos (usuario_id, turno_id, fecha_inicio, fecha_fin)
-       VALUES (?, ?, ?, ?)`,
+       VALUES ($1, $2, $3, $4)`,
       [id, turno_id, fecha_inicio, fecha_fin]
     );
     
@@ -807,7 +776,7 @@ router.delete('/usuarios/:userId/turnos/:asignacionId', async (req, res) => {
   try {
     const { asignacionId } = req.params;
     
-    await db.query('DELETE FROM usuario_turnos WHERE id = ?', [asignacionId]);
+    await db.query('DELETE FROM usuario_turnos WHERE id = $1', [asignacionId]);
     
     console.log('✅ Asignación de turno eliminada:', asignacionId);
     
